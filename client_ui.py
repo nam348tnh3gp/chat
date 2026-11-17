@@ -22,10 +22,7 @@ console = Console(force_terminal=True if sys.stdout.isatty() else None)
 
 DEFAULT_SERVERS = [
     "http://localhost:5000",
-    "https://chat-vps2.onrender.com",
-    "https://chat-vps3.onrender.com",
-    "https://chat-vps4.onrender.com",
-    "https://chat-vps5.onrender.com",
+    "https://chat-vps2-v5s2.onrender.com/",
 ]
 SERVERS = [s.strip().rstrip("/") for s in os.getenv("CHAT_SERVERS", "").split(",") if s.strip()] or DEFAULT_SERVERS
 PROBE_TIMEOUT = 60
