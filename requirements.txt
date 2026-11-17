@@ -1,7 +1,8 @@
-flask
-flask-socketio
-eventlet
-redis
-python-socketio[client]
-rich
-eventlet
+flask>=3.0
+flask-socketio>=5.3
+python-socketio[client]>=5.8
+eventlet>=0.36
+redis>=5.0
+rich>=13.7
+prompt_toolkit>=3.0
+requests>=2.31
