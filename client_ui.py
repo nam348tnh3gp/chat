@@ -64,9 +64,15 @@ class ChatClient:
         me = user == self.username
         color = self.color(user)
 
+        # Fix: Panel(expand=False) co theo nội dung -> msg ngắn hơn header
+        # (ts + user) sẽ làm title/subtitle bị cắt cụt. Pad content đủ rộng.
+        header_plain = f"{ts} {user}"
+        min_content = len(header_plain) + 4
+        display_msg = msg if len(msg) >= min_content else msg + " " * (min_content - len(msg))
+
         header = Text.assemble((ts, "dim"), " ", (user, f"bold {color}"))
         bubble = Panel(
-            Text(msg),
+            Text(display_msg),
             title=None if me else header,
             subtitle=header if me else None,
             subtitle_align="right",
@@ -123,7 +129,7 @@ class ChatClient:
                 self.info(f"❌ Mất kết nối {url}, đang tìm server khác...", "red")
 
         try:
-            sio.connect(url, transports=["websocket"], auth={"token": CHAT_TOKEN}, wait_timeout=10)
+            sio.connect(url, transports=["polling"], auth={"token": CHAT_TOKEN}, wait_timeout=10)
         except Exception as e:
             self.info(f"⚠️ Không connect được {url}: {e}", "red")
             return False

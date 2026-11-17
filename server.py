@@ -27,6 +27,7 @@ elif ASYNC_MODE != "threading":
 
 from flask import Flask, jsonify, request
 from flask_socketio import SocketIO
+from waitress import serve
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("chat")
@@ -243,6 +244,7 @@ def handle_message(data):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    log.info("Chat server cổng %s (store=%s, async=%s)",
+    log.info("Chat server cổng %s (store=%s, async=%s, wsgi=waitress)",
              port, store.kind, ASYNC_MODE)
-    socketio.run(app, host="0.0.0.0", port=port)
+    # Waitress không hỗ trợ WebSocket -> client phải dùng polling
+    serve(app, host="0.0.0.0", port=port, threads=8)
