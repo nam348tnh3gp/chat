@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import getpass
 import threading
 from collections import OrderedDict
 from datetime import datetime
@@ -27,9 +28,9 @@ DEFAULT_SERVERS = [
     "https://chat-vps5.onrender.com",
 ]
 SERVERS = [s.strip().rstrip("/") for s in os.getenv("CHAT_SERVERS", "").split(",") if s.strip()] or DEFAULT_SERVERS
-CHAT_TOKEN = os.getenv("CHAT_TOKEN", "")
 PROBE_TIMEOUT = 60
 MAX_MSG_LEN = 2000
+MAX_USER_LEN = 30
 HISTORY_LIMIT = 15
 
 COLORS = ["cyan", "magenta", "green", "yellow", "blue", "red"]
@@ -38,9 +39,20 @@ HELP = (
     "[bold]/server[/]  server đang dùng   [bold]/clear[/]  xoá màn hình   [bold]/quit[/]  thoát"
 )
 
+ERR_MSG = {
+    "invalid_credentials": "Sai username hoặc password",
+    "username_taken": "Username đã tồn tại, thử tên khác",
+    "invalid_username": "Username phải 3–30 ký tự: chữ/số/_.-",
+    "weak_password": "Password phải >= 6 ký tự",
+    "rate_limited": "Thử quá nhiều lần, đợi chút rồi lại",
+    "store_unavailable": "Server không lưu được, thử lại sau",
+}
+
+
 class ChatClient:
-    def __init__(self, username):
-        self.username = username
+    def __init__(self):
+        self.username = None
+        self.token = None
         self.sio = None
         self.url = None
         self.stop = threading.Event()
@@ -49,6 +61,7 @@ class ChatClient:
         self.colors = {}
         self.first_history = True
 
+    # ─── Hiển thị ───
     def color(self, user):
         if user not in self.colors:
             self.colors[user] = COLORS[len(self.colors) % len(COLORS)]
@@ -64,8 +77,6 @@ class ChatClient:
         me = user == self.username
         color = self.color(user)
 
-        # Fix: Panel(expand=False) co theo nội dung -> msg ngắn hơn header
-        # (ts + user) sẽ làm title/subtitle bị cắt cụt. Pad content đủ rộng.
         header_plain = f"{ts} {user}"
         min_content = len(header_plain) + 4
         display_msg = msg if len(msg) >= min_content else msg + " " * (min_content - len(msg))
@@ -86,6 +97,7 @@ class ChatClient:
     def info(self, text, style=None):
         console.print(Text(text, style=style or ""))
 
+    # ─── Dedup ───
     def remember(self, packet):
         key = packet.get("id") or f"{packet.get('time')}|{packet.get('user')}|{packet.get('msg')}"
         with self.seen_lock:
@@ -105,8 +117,9 @@ class ChatClient:
         return bool(self.sio and self.sio.connected)
 
     def headers(self):
-        return {"X-Chat-Token": CHAT_TOKEN} if CHAT_TOKEN else {}
+        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
+    # ─── Probe & auth ───
     def probe(self, url):
         try:
             r = requests.get(f"{url}/health", timeout=PROBE_TIMEOUT)
@@ -116,6 +129,64 @@ class ChatClient:
             pass
         return url, False
 
+    def find_server(self):
+        ex = ThreadPoolExecutor(max_workers=len(SERVERS))
+        futures = [ex.submit(self.probe, u) for u in SERVERS]
+        try:
+            for fut in as_completed(futures, timeout=PROBE_TIMEOUT + 5):
+                url, ok = fut.result()
+                if ok:
+                    return url
+        except FuturesTimeout:
+            pass
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        return None
+
+    def authenticate(self, base_url):
+        console.print(Panel(
+            "[bold]1[/] Đăng nhập   [bold]2[/] Đăng ký   [bold]3[/] Thoát",
+            title="🔐 Xác thực", border_style="cyan",
+        ))
+        while True:
+            choice = Prompt.ask("Lựa chọn", choices=["1", "2", "3"], default="1")
+            if choice == "3":
+                return False
+            username = Prompt.ask("👤 Username").strip()[:MAX_USER_LEN]
+            if not username:
+                self.info("⚠️ Username không được trống.", "yellow")
+                continue
+            try:
+                password = getpass.getpass("🔑 Password: ")
+            except (EOFError, KeyboardInterrupt):
+                return False
+            if not password:
+                self.info("⚠️ Password không được trống.", "yellow")
+                continue
+
+            endpoint = "/auth/login" if choice == "1" else "/auth/register"
+            try:
+                r = requests.post(base_url + endpoint,
+                                  json={"username": username, "password": password},
+                                  timeout=15)
+            except requests.RequestException as e:
+                self.info(f"⚠️ Không gọi được server: {e}", "red")
+                return False
+            try:
+                data = r.json()
+            except ValueError:
+                data = {}
+
+            if r.ok and data.get("token"):
+                self.token = data["token"]
+                self.username = data.get("username", username)
+                self.info(f"✅ Xin chào {self.username}!", "green")
+                return True
+
+            err = data.get("error", f"HTTP {r.status_code}")
+            self.info(f"❌ {ERR_MSG.get(err, err)}", "red")
+
+    # ─── Socket ───
     def try_connect(self, url):
         sio = socketio.Client(reconnection=False, request_timeout=10)
 
@@ -129,7 +200,8 @@ class ChatClient:
                 self.info(f"❌ Mất kết nối {url}, đang tìm server khác...", "red")
 
         try:
-            sio.connect(url, transports=["polling"], auth={"token": CHAT_TOKEN}, wait_timeout=10)
+            sio.connect(url, transports=["polling"],
+                    auth={"token": self.token or ""}, wait_timeout=10)
         except Exception as e:
             self.info(f"⚠️ Không connect được {url}: {e}", "red")
             return False
@@ -161,9 +233,10 @@ class ChatClient:
         if not self.url:
             return
         try:
-            r = requests.get(f"{self.url}/history", params={"limit": limit}, headers=self.headers(), timeout=10)
+            r = requests.get(f"{self.url}/history", params={"limit": limit},
+                             headers=self.headers(), timeout=10)
             if r.status_code == 401:
-                self.info("⚠️ Sai CHAT_TOKEN (server từ chối /history)", "red")
+                self.info("⚠️ Token không hợp lệ / hết hạn (server từ chối /history)", "red")
                 return
             r.raise_for_status()
             msgs = r.json()
@@ -185,13 +258,13 @@ class ChatClient:
         backoff = 1
         while not self.stop.is_set():
             if not self.connected:
-                with console.status("[cyan]Đang kết nối server (Render có thể mất ~30s để thức dậy)...[/]"):
+                with console.status("[cyan]Đang kết nối lại...[/]"):
                     ok = self.connect_any()
                 if ok:
                     backoff = 1
                     self.load_history()
                 else:
-                    self.info(f"⚠️ Chưa có server nào sẵn sàng, thử lại sau {backoff}s", "yellow")
+                    self.info(f"⚠️ Chưa có server sẵn sàng, thử lại sau {backoff}s", "yellow")
                     self.stop.wait(backoff)
                     backoff = min(backoff * 2, 30)
             else:
@@ -211,8 +284,7 @@ class ChatClient:
                 self.info(f"⚠️ Server từ chối tin nhắn: {reason}", "yellow")
 
         try:
-
-            self.sio.emit("message", {"user": self.username, "msg": text}, callback=ack)
+            self.sio.emit("message", {"msg": text}, callback=ack)
         except Exception as e:
             self.info(f"⚠️ Gửi lỗi: {e}", "red")
 
@@ -224,19 +296,45 @@ class ChatClient:
         except Exception:
             pass
 
-def main():
-    username = Prompt.ask("👤 Nhập tên của bạn").strip()[:30] or "guest"
-    client = ChatClient(username)
 
+def main():
+    console.print(Panel("[bold cyan]✨ Chat CLI — Đăng nhập để bắt đầu ✨[/]", border_style="cyan"))
+    client = ChatClient()
+
+    # 1. Tìm server
+    with console.status("[cyan]Đang tìm server...[/]"):
+        base = client.find_server()
+    if not base:
+        console.print("[red]❌ Không tìm được server nào.[/]")
+        return
+    console.print(Panel(f"[green]🌐 Server: {base}[/]", border_style="green"))
+
+    # 2. Đăng nhập / đăng ký
+    if not client.authenticate(base):
+        console.print("[red]👋 Đã huỷ.[/]")
+        return
+
+    # 3. Kết nối socket
+    with console.status("[cyan]Đang kết nối socket...[/]"):
+        if not client.try_connect(base):
+            console.print("[red]❌ Kết nối socket thất bại.[/]")
+            return
+    client.load_history()
+
+    # 4. Supervisor
     threading.Thread(target=client.supervisor, daemon=True).start()
-    console.print(Panel("[bold cyan]✨ Bắt đầu chat nào! Gõ /help để xem lệnh, Ctrl+C để thoát ✨[/]", border_style="cyan"))
+
+    console.print(Panel(
+        "[bold cyan]💬 Bắt đầu chat! Gõ /help để xem lệnh, Ctrl+C để thoát[/]",
+        border_style="cyan",
+    ))
 
     session = PromptSession()
     try:
         with patch_stdout(raw=True):
             while True:
                 try:
-                    text = session.prompt(f"{username}> ").strip()
+                    text = session.prompt(f"{client.username}> ").strip()
                 except (KeyboardInterrupt, EOFError):
                     break
                 if not text:
@@ -264,6 +362,7 @@ def main():
     finally:
         console.print("\n[red]👋 Thoát chat[/]")
         client.close()
+
 
 if __name__ == "__main__":
     main()
